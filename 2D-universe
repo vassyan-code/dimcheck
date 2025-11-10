@@ -1,0 +1,72 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import trange
+from copy import deepcopy
+from dataclasses import dataclass
+
+@dataclass
+class Cell2D:
+    q: complex          # |0> или |1> (для простоты: 0+1j или 1+0j)
+    metric: float       # скалярная кривизна >= 1 (1 = плоско)
+    last_updated: int   # локальный такт
+
+NX, NY = 64, 64
+TICKS  = 200
+
+def make_flat_universe():
+    return [[Cell2D(q=1+0j, metric=1.0, last_updated=0)
+             for _ in range(NY)] for _ in range(NX)]
+
+def inject_mass(grid, x, y, mass=5.0):
+    grid[x][y].metric = mass
+
+def neighbors(x, y):
+    return [((x+dx)%NX, (y+dy)%NY)
+            for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]]
+
+def local_cost(cell, neighs, tick):
+    # Чем больше metric, тем выше cost → реже обновление
+    cost_metric = cell.metric
+    # Разница тактов → штраф за несинхронность
+    cost_sync = sum((tick - n.last_updated)**2 for _,n in neighs)
+    return cost_metric + 0.1*cost_sync
+
+def compute_new_state(cell, neighs, tick):
+    # Простейшее правило: поворот фазы q против часовой
+    new_q = cell.q * np.exp(1j * 0.1 / cell.metric)
+    # Сохраняем импульс: |q| не меняется
+    new_q /= abs(new_q) if abs(new_q) else 1
+    # Обновляем такт
+    return Cell2D(q=new_q, metric=cell.metric, last_updated=tick)
+
+def update_universe(grid, tick):
+    new_grid = deepcopy(grid)
+    for x in range(NX):
+        for y in range(NY):
+            cell = grid[x][y]
+            neighs = [(n, grid[n[0]][n[1]]) for n in neighbors(x,y)]
+            # Шанс обновления ∝ 1/cost (чем тяжелее, тем медленнее)
+            if np.random.rand() < 1.0/local_cost(cell, neighs, tick):
+                new_grid[x][y] = compute_new_state(cell, neighs, tick)
+    return new_grid
+
+# --- Запуск ---
+grid = make_flat_universe()
+inject_mass(grid, NX//2, NY//2, mass=8.0)
+
+# Снимем «время» в каждой точке: разница между глобальным и локальным тактом
+def time_lapse_map(grid, tick):
+    return [[tick - cell.last_updated for cell in row] for row in grid]
+
+frames = []
+for t in trange(TICKS):
+    grid = update_universe(grid, t)
+    if t % 10 == 0:
+        frames.append(np.array(time_lapse_map(grid, t)))
+
+# --- Визуализация ---
+plt.figure(figsize=(5,5))
+plt.imshow(frames[-1], cmap='plasma', origin='lower')
+plt.colorbar(label='время отставания (тактов)')
+plt.title('Гравитационное замедление времени в 2D-вселенной')
+plt.show()
