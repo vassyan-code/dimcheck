@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+import numpy as np
+import argparse, os, json, time
+try:
+    import cupy as cp
+    xp = cp
+except ImportError:
+    xp = np
+from tqdm import trange
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import eigsh
+import matplotlib.pyplot as plt
+
+# ---------- параметры ----------
+parser = argparse.ArgumentParser()
+parser.add_argument('--L', type=int, default=64, help='linear size')
+parser.add_argument('--T', type=int, default=200, help='ticks')
+parser.add_argument('--gpu', action='store_true')
+parser.add_argument('--snap', type=int, default=10, help='snapshot every')
+parser.add_argument('--out', default='snapshots')
+args = parser.parse_args()
+
+L = args.L
+N = L * L
+T = args.T
+os.makedirs(args.out, exist_ok=True)
+
+# ---------- граф: 2D тор ----------
+# рёбра: i < j, 4 соседа + next-nearest (чтобы не разваливается)
+def build_edges(L):
+    x = np.arange(L); y = np.arange(L)
+    xx, yy = np.meshgrid(x, y, indexing='ij')
+    idx = xx * L + yy  # номер вершины
+    edges = []
+    for dx, dy in [(-1,0),(1,0),(0,-1),(0,1), (-1,-1),(-1,1),(1,-1),(1,1)]:
+        xx2 = (xx + dx) % L; yy2 = (yy + dy) % L
+        jdx = xx2 * L + yy2
+        mask = idx < jdx
+        edges.append(np.stack([idx[mask], jdx[mask]], axis=1))
+    edges = np.concatenate(edges, axis=0)
+    return np.unique(edges, axis=0)
+
+edges = build_edges(L)
+E = edges.shape[0]
+print(f'L={L}  vertices={N}  edges={E}')
+
+# ---------- начальное состояние ----------
+# амплитуды на рёбрах |q|=1, случайная фаза
+q = xp.exp(1j * 2*np.pi * xp.random.rand(E).astype(np.complex64))
+# метрика = 1 (плоско)
+metric = xp.ones(N, dtype=np.float32)
+# локальные часы
+last_tick = xp.zeros(N, dtype=np.int32)
+
+# ---------- гамильтониан ----------
+# H =  Σ<i,j>  ( |i><j| + h.c. )  +  Σ_i  μ_i |i><i|
+# μ_i = metric_i - 1  (вакуум = 0)
+row = np.concatenate([edges[:,0], edges[:,1]])
+col = np.concatenate([edges[:,1], edges[:,0]])
+data = np.ones(2*E, dtype=np.float32)
+H0 = csr_matrix((data, (row, col)), shape=(N,N))  # базовая связь
+
+def build_ham(mu):
+    # mu = массив на device или host
+    if hasattr(mu, 'get'):  # cupy
+        mu = mu.get()
+    diag = mu.copy()
+    H = H0 + csr_matrix((diag, (np.arange(N), np.arange(N))), shape=(N,N))
+    return H.astype(np.complex64)
+
+# ---------- унитарное обновление ----------
+# U = e^{-i H Δt}, Δt = 1 (в условных единицах)
+# вычисляем **1 раз за тик**, затем применяем к волновой функции
+def unitary_step(q_edge, H):
+    # вектор состояния на вершинах: усредняем вклад рёбер
+    psi = xp.zeros(N, dtype=np.complex64)
+    for e in range(E):
+        i, j = edges[e]
+        w = q_edge[e]
+        psi[i] += w; psi[j] += w.conj()
+    # нормируем
+    psi /= xp.sqrt(xp.sum(xp.abs(psi)**2) + 1e-12)
+    # диагонализируем H (sparse)
+    evals, evecs = eigsh(H, k=20, which='SA')  # 20 минимальных
+    evals = xp.asarray(evals.astype(np.complex64))
+    evecs = xp.asarray(evecs.astype(np.complex64))
+    # проекция psi на собственные базисы
+    coef = evecs.T.conj() @ psi
+    # U|psi> = Σ_n e^{-i E_n} coef_n |n>
+    new_coef = xp.exp(-1j * evals) * coef
+    new_psi = evecs @ new_coef
+    # обратно распределить на рёбра (симметрично)
+    new_q = q_edge.copy()
+    for e in range(E):
+        i, j = edges[e]
+        new_q[e] = (new_psi[i] + new_psi[j].conj()) * 0.5
+    # нормируем рёбра
+    new_q /= xp.sqrt(xp.sum(xp.abs(new_q)**2) + 1e-12) * xp.sqrt(E)
+    return new_q
+
+# ---------- emergent-метрика ----------
+# g_{μν} = δ_{μν} - c ∇_μ n_v ∇_ν n_v ,  c = 0.1
+# n_v = tick - last_tick[i]
+def update_metric(tick):
+    n_v = tick - last_tick
+    # простейший градиент на торе
+    n_v = n_v.reshape(L,L)
+    gx = xp.roll(n_v, -1, axis=0) - xp.roll(n_v, 1, axis=0)
+    gy = xp.roll(n_v, -1, axis=1) - xp.roll(n_v, 1, axis=1)
+    # метрика = 1 + 0.1*(|gx|+|gy|)  (min=1)
+    new_metric = 1.0 + 0.1*(xp.abs(gx) + xp.abs(gy))
+    return new_metric.ravel()
+
+# ---------- локальное отставание ----------
+# вершина пропускает такт, если ∑_reb |q|^2 > threshold
+# threshold = 1 (нормировка рёбер = 1 в сумме)
+def local_update_rule(q_edge, tick):
+    # вес вершины = сумма |q|^2 инцидентных рёбер
+    weight = xp.zeros(N, dtype=np.float32)
+    for e in range(E):
+        i, j = edges[e]
+        w = xp.abs(q_edge[e])**2
+        weight[i] += w
+        weight[j] += w
+    # пропускаем такт, если "тяжело"
+    skip = weight > 1.0
+    last_tick[skip] = tick  # фиксируем отставание
+
+# ---------- main loop ----------
+snapshots = []
+for tick in trange(T):
+    H = build_ham(metric.get() if hasattr(metric,'get') else metric)
+    q = unitary_step(q, H)
+    local_update_rule(q, tick)
+    metric = update_metric(tick)
+
+    if tick % args.snap == 0:
+        # карта времени отставания
+        lapse = (tick - last_tick).reshape(L,L)
+        snapshots.append(lapse.get() if hasattr(lapse,'get') else lapse.copy())
+
+print('Сохранение snapshot...')
+np.savez_compressed(f'{args.out}/lapse_L{L}.npz', snaps=np.array(snapshots))
+
+# ---------- визуализация ----------
+plt.imshow(snapshots[-1], cmap='plasma', origin='lower')
+plt.colorbar(label='Δτ = tick - last_tick')
+plt.title(f'Эмерджентное замедление времени, L={L}')
+plt.savefig(f'{args.out}/lapse_L{L}.png', dpi=150)
+plt.show()
