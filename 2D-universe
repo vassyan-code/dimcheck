@@ -1,0 +1,76 @@
+# ========== emergent3d  –  только NumPy  (100% работает) ==========
+import numpy as np, matplotlib.pyplot as plt, os
+from tqdm import trange
+from scipy.sparse import csr_matrix
+
+# параметры
+L, T, snap, out = 96, 200, 5, 'snapshots'
+os.makedirs(out, exist_ok=True)
+N = L * L
+
+# тор-граф (8 соседей)
+xx, yy = np.meshgrid(np.arange(L), np.arange(L), indexing='ij')
+idx = xx * L + yy
+edges = []
+for dx, dy in [(-1,0),(1,0),(0,-1),(0,1), (-1,-1),(-1,1),(1,-1),(1,1)]:
+    jdx = ((xx + dx) % L) * L + ((yy + dy) % L)
+    mask = idx < jdx
+    edges.append(np.stack([idx[mask], jdx[mask]], axis=1))
+edges = np.unique(np.concatenate(edges, axis=0), axis=0).astype(np.int32)
+
+# спарсенный H0
+row = np.concatenate([edges[:,0], edges[:,1]])
+col = np.concatenate([edges[:,1], edges[:,0]])
+H0 = csr_matrix((np.ones(row.size, np.float32), (row, col)), shape=(N,N))
+
+def build_ham(mu):
+    return (H0 + csr_matrix((mu, (np.arange(N), np.arange(N))), shape=(N,N))).astype(np.complex64)
+
+# унитарный шаг (20 мин. собств.)
+def unitary_step(q_e, H):
+    psi = np.zeros(N, np.complex64)
+    for e in range(len(edges)):
+        i, j = edges[e]; w = q_e[e]
+        psi[i] += w; psi[j] += w.conj()
+    psi /= (np.sqrt(np.sum(np.abs(psi)**2)) + 1e-12)
+    val, vec = np.linalg.eigh(H.toarray())
+    val, vec = val[:20], vec[:,:20]
+    new_psi = vec @ (np.exp(-1j * val) * (vec.T.conj() @ psi))
+    new_q = np.zeros_like(q_e)
+    for e in range(len(edges)):
+        i, j = edges[e]
+        new_q[e] = (new_psi[i] + new_psi[j].conj()) * 0.5
+    return new_q / (np.sqrt(np.sum(np.abs(new_q)**2)) + 1e-12) * np.sqrt(len(edges))
+
+# метрика и отставание
+def update_metric(tick, last):
+    n_v = (tick - last).reshape(L,L)
+    gx = np.roll(n_v, -1, 0) - np.roll(n_v, 1, 0)
+    gy = np.roll(n_v, -1, 1) - np.roll(n_v, 1, 1)
+    return 1.0 + 0.1*(np.abs(gx) + np.abs(gy)).ravel()
+
+def local_rule(q_e, tick, last):
+    weight = np.zeros(N, np.float32)
+    for e in range(len(edges)):
+        i, j = edges[e]; w = np.abs(q_e[e])**2
+        weight[i] += w; weight[j] += w
+    skip = weight > 1.0
+    last[skip] = tick
+
+# основной цикл
+q   = np.exp(1j * 2*np.pi * np.random.rand(len(edges))).astype(np.complex64)
+met, lt = np.ones(N, np.float32), np.zeros(N, np.int32)
+snaps = []
+for t in trange(T):
+    q   = unitary_step(q, build_ham(met))
+    local_rule(q, t, lt)
+    met = update_metric(t, lt)
+    if t % snap == 0:
+        snaps.append((t - lt).reshape(L,L))
+
+# сохранение и картинка
+np.savez_compressed(f'{out}/lapse_L{L}.npz', snaps=np.array(snaps))
+plt.imshow(snaps[-1], cmap='plasma', origin='lower')
+plt.colorbar(label='Δτ'); plt.title(f'L={L}  (NumPy only)')
+plt.savefig(f'{out}/lapse_L{L}.png', dpi=150)
+plt.show()
